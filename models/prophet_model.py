@@ -1,6 +1,7 @@
-"""Prophet model wrapper with in-memory caching and TTL."""
+"""Prophet model wrapper with in-memory caching, TTL, and LRU eviction."""
 
 import time
+from collections import OrderedDict
 from typing import Any
 
 import pandas as pd
@@ -8,21 +9,24 @@ from prophet import Prophet
 
 
 class ProphetModelCache:
-    """In-memory cache for trained Prophet models with TTL expiration.
+    """In-memory cache for trained Prophet models with TTL expiration and LRU eviction.
 
     Attributes:
-        _cache: Dictionary mapping product_id to cached entry.
+        _cache: OrderedDict mapping product_id to cached entry (LRU order).
         _ttl_seconds: Time-to-live for cached models in seconds.
+        _max_size: Maximum number of models to cache before LRU eviction.
     """
 
-    def __init__(self, ttl_seconds: int = 3600):
+    def __init__(self, ttl_seconds: int = 3600, max_size: int = 10):
         """Initialize the model cache.
 
         Args:
             ttl_seconds: TTL for cached models in seconds (default 1 hour).
+            max_size: Maximum cache entries before LRU eviction (default 10).
         """
-        self._cache: dict[int, dict[str, Any]] = {}
+        self._cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._ttl_seconds = ttl_seconds
+        self._max_size = max_size
 
     def get(self, product_id: int) -> Prophet | None:
         """Retrieve a cached Prophet model if it exists and is not expired.
@@ -39,19 +43,29 @@ class ProphetModelCache:
         if time.time() - entry["timestamp"] > self._ttl_seconds:
             del self._cache[product_id]
             return None
+        # Move to end (most recently used)
+        self._cache.move_to_end(product_id)
         return entry["model"]
 
     def set(self, product_id: int, model: Prophet) -> None:
         """Store a trained Prophet model in the cache.
 
+        If the cache exceeds max_size, the least-recently-used entry is evicted.
+
         Args:
             product_id: The product identifier.
             model: The trained Prophet model.
         """
+        if product_id in self._cache:
+            # Update existing: move to end
+            self._cache.move_to_end(product_id)
         self._cache[product_id] = {
             "model": model,
             "timestamp": time.time(),
         }
+        # LRU eviction
+        while len(self._cache) > self._max_size:
+            self._cache.popitem(last=False)
 
     def clear(self) -> None:
         """Clear all cached models."""
