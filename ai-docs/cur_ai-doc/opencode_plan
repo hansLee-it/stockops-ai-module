@@ -1,0 +1,24 @@
+# StockOps AI Module Verification Plan
+
+## Minimal command path
+
+Run from `stockops-ai-module/`:
+
+```bash
+python -m compileall .
+python -m pytest
+```
+
+## Current harness coverage
+
+- API-key auth for missing, wrong, and valid `X-API-Key` requests.
+- Request validation for invalid `days`, invalid `product_id`, and invalid evaluation-history `limit`.
+- Data shortage behavior through the `/predict` HTTP path and direct `forecast_async` shortage guard.
+- Model failure behavior through `/predict` `RuntimeError` mapping.
+- DB failure behavior through `/evaluate/history/{product_id}` `RuntimeError` mapping.
+
+## Notes
+
+- No external secrets are required for tests; `AI_MODULE_API_KEY` and DB/model calls are monkeypatched.
+- The AI module currently has no request `scope` field or endpoint parameter; the harness validates the request boundaries that exist in `main.py`.
+- Workspace verification note: this container has `python3` but no `python`, `pip`, `pip3`, `uv`, `ensurepip`, FastAPI, or pytest installed. `python3 -m compileall .` passes; `python -m compileall .`, `python -m pytest`, and `python3 -m pytest` are blocked by the interpreter/package availability described above.
