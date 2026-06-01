@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Path, Request, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -122,7 +122,11 @@ async def predict_bulk(request: BulkPredictRequest, _=Depends(verify_api_key)) -
 
 
 @app.get("/evaluate/{product_id}", response_model=EvaluateResponse)
-async def evaluate_model(product_id: int, model_version: str = "prophet", _=Depends(verify_api_key)) -> EvaluateResponse:
+async def evaluate_model(
+    product_id: int = Path(..., ge=1),
+    model_version: str = "prophet",
+    _=Depends(verify_api_key),
+) -> EvaluateResponse:
     """Evaluate forecast accuracy for a product using historical data."""
     try:
         result = await evaluate_async(product_id, model_version)
@@ -134,7 +138,11 @@ async def evaluate_model(product_id: int, model_version: str = "prophet", _=Depe
 
 
 @app.get("/evaluate/history/{product_id}", response_model=EvaluateHistoryResponse)
-async def evaluation_history(product_id: int, limit: int = 20, _=Depends(verify_api_key)) -> EvaluateHistoryResponse:
+async def evaluation_history(
+    product_id: int = Path(..., ge=1),
+    limit: int = 20,
+    _=Depends(verify_api_key),
+) -> EvaluateHistoryResponse:
     """Fetch past evaluation results for a product."""
     if limit < 1 or limit > 100:
         raise HTTPException(
