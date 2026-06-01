@@ -43,6 +43,17 @@ docker build -t stockops-ai-module .
 docker run -p 8000:8000 --env-file .env stockops-ai-module
 ```
 
+## Verification
+
+Run these commands from `stockops-ai-module/`:
+
+```bash
+python -m compileall .
+python -m pytest
+```
+
+The pytest harness uses FastAPI `TestClient` with monkeypatched DB/model calls, so it does not require external secrets or a live database.
+
 ## Environment Variables
 
 | Variable | Default | Description |
