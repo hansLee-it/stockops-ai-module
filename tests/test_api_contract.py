@@ -165,3 +165,25 @@ def test_evaluation_history_maps_db_failure_to_server_error(
 
     assert response.status_code == 500
     assert response.json()["detail"] == "Database query failed"
+
+
+def test_bulk_predict_reports_partial_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def mixed_forecast(product_id: int, days: int) -> dict[str, object]:
+        if product_id == 2:
+            raise ValueError("Insufficient historical data for product 2.")
+        return await successful_forecast(product_id, days)
+
+    monkeypatch.setattr(main, "forecast_async", mixed_forecast)
+
+    response = client.post(
+        "/predict/bulk",
+        headers=auth_headers(),
+        json={"products": [{"product_id": 1, "days": 1}, {"product_id": 2, "days": 1}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["successful"] == 1
+    assert "product_id=2" in response.json()["detail"]["errors"][0]

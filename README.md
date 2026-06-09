@@ -59,22 +59,115 @@ The pytest harness uses FastAPI `TestClient` with monkeypatched DB/model calls, 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | *(required)* | PostgreSQL connection string |
+| `AI_MODULE_API_KEY` | *(empty = dev mode)* | Shared secret for `X-API-Key` header auth |
 | `SERVICE_HOST` | `0.0.0.0` | Uvicorn bind host |
 | `SERVICE_PORT` | `8000` | Uvicorn bind port |
-| `MODEL_CACHE_TTL_SECONDS` | `3600` | Prophet model cache TTL |
+| `MODEL_CACHE_TTL_SECONDS` | `3600` | Prophet model cache TTL in seconds |
+| `MODEL_CACHE_MAX_SIZE` | `10` | Max cached models before LRU eviction |
 | `MIN_HISTORY_DAYS` | `14` | Minimum historical data days required |
 | `MAPE_ALERT_THRESHOLD` | `30.0` | MAPE threshold for warning logs |
 | `EVALUATION_TRAIN_RATIO` | `0.8` | Train/test split ratio for evaluation |
+| `DB_POOL_MIN` | `2` | DB connection pool minimum connections |
+| `DB_POOL_MAX` | `10` | DB connection pool maximum connections |
+| `DB_CONNECT_TIMEOUT` | `10` | DB connection timeout in seconds |
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check |
-| POST | `/predict` | Single product forecast |
-| POST | `/predict/bulk` | Bulk forecast |
-| GET | `/evaluate/{product_id}` | Evaluate model accuracy |
-| GET | `/evaluate/history/{product_id}` | Fetch evaluation history |
+| Method | Path | Auth required | Description |
+|--------|------|---------------|-------------|
+| GET | `/health` | No | Health check |
+| POST | `/predict` | Yes | Single product forecast |
+| POST | `/predict/bulk` | Yes | Bulk forecast (up to 50 products) |
+| GET | `/evaluate/{product_id}` | Yes | Evaluate model accuracy |
+| GET | `/evaluate/history/{product_id}` | Yes | Fetch evaluation history |
+
+### POST /predict
+
+Request:
+
+```json
+{
+  "product_id": 1,
+  "days": 7
+}
+```
+
+Response (`200 OK`):
+
+```json
+{
+  "product_id": 1,
+  "days": 7,
+  "forecast": [
+    { "ds": "2026-06-01", "yhat": 10.25, "yhat_lower": 8.0, "yhat_upper": 12.5 }
+  ]
+}
+```
+
+Errors: `400` insufficient history, `422` invalid input, `500` model failure.
+
+### POST /predict/bulk
+
+Request:
+
+```json
+{
+  "products": [
+    { "product_id": 1, "days": 7 },
+    { "product_id": 2, "days": 3 }
+  ]
+}
+```
+
+Response (`200 OK`): array of forecast objects (same shape as `/predict`).
+
+Partial failure (`400`): returned when at least one product fails.
+
+```json
+{
+  "detail": {
+    "errors": ["product_id=2: Insufficient historical data for product 2."],
+    "successful": 1
+  }
+}
+```
+
+### GET /evaluate/{product_id}
+
+Response (`200 OK`):
+
+```json
+{
+  "product_id": 1,
+  "mae": 2.1234,
+  "rmse": 3.4567,
+  "mape": 12.5678,
+  "model_version": "prophet"
+}
+```
+
+### GET /evaluate/history/{product_id}
+
+Query params: `limit` (1–100, default 20).
+
+Response (`200 OK`):
+
+```json
+{
+  "product_id": 1,
+  "history": [
+    { "id": 5, "mae": 2.1, "rmse": 3.4, "mape": 12.5, "evaluated_at": "...", "model_version": "prophet" }
+  ]
+}
+```
+
+### GET /health
+
+Response (`200 OK`):
+
+```json
+{ "status": "ok" }
+```
 
 ## Architecture
 
