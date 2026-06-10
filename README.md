@@ -180,3 +180,8 @@ Request → FastAPI → forecasting.py → prophet_model.py
 ## License
 
 Team Project - Educational Purpose
+## Environment And Secrets
+
+See [docs/ENVIRONMENT_SETUP.md](docs/ENVIRONMENT_SETUP.md) for local `.env`, GitHub Actions secrets, and deployment environment setup.
+
+Never commit `.env`, real credentials, Terraform state, or AI-agent local configuration files.
