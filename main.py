@@ -13,10 +13,15 @@ from services.forecasting import (
     fetch_evaluation_history,
     forecast_async,
 )
+from telemetry import setup_tracing
 
 load_dotenv()
 
 app = FastAPI(title="StockOps AI Forecasting Service", version="1.0.0")
+
+# Enable OpenTelemetry distributed tracing (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT
+# is set). Must run after the app is created and before requests are served.
+setup_tracing(app)
 
 # --- API Key Authentication ---
 AI_MODULE_API_KEY = os.environ.get("AI_MODULE_API_KEY", "")

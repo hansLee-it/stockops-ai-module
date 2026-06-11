@@ -10,3 +10,10 @@ python-dateutil>=2.8.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
 httpx>=0.26.0
+
+# OpenTelemetry distributed tracing (Phase 1: traces only, exported via OTLP/HTTP).
+# Keep the opentelemetry-* versions in lockstep to avoid API/SDK mismatches.
+opentelemetry-sdk>=1.27.0,<2.0.0
+opentelemetry-exporter-otlp-proto-http>=1.27.0,<2.0.0
+opentelemetry-instrumentation-fastapi>=0.48b0,<1.0.0
+opentelemetry-instrumentation-psycopg2>=0.48b0,<1.0.0
