@@ -10,8 +10,16 @@ import numpy as np
 import pandas as pd
 import psycopg2
 import psycopg2.pool
+from opentelemetry import trace
 from psycopg2.extras import RealDictCursor
 
+from metrics import (
+    EVALUATION_MAPE,
+    FORECAST_DURATION,
+    FORECAST_REQUESTS,
+    MODEL_CACHE_EVENTS,
+    MODEL_TRAIN_DURATION,
+)
 from models.prophet_model import (
     ProphetModelCache,
     create_prophet_model,
@@ -20,6 +28,11 @@ from models.prophet_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Module tracer. trace.get_tracer() returns a ProxyTracer that is a no-op until
+# setup_tracing() installs a real TracerProvider, so importing this at module load
+# is safe and keeps tracing opt-in (no spans exported when no OTLP endpoint is set).
+tracer = trace.get_tracer(__name__)
 
 MIN_HISTORY_DAYS = int(os.environ.get("MIN_HISTORY_DAYS", "14"))
 MODEL_CACHE_TTL_SECONDS = int(os.environ.get("MODEL_CACHE_TTL_SECONDS", "3600"))
@@ -78,32 +91,38 @@ _model_cache = ProphetModelCache(ttl_seconds=MODEL_CACHE_TTL_SECONDS, max_size=M
 
 def fetch_outbound_history(product_id: int) -> pd.DataFrame:
     """Fetch daily aggregated outbound quantities for a product."""
-    query = """
-        SELECT o.outbound_date AS ds, SUM(oi.quantity) AS y
-        FROM outbounds o
-        JOIN outbound_items oi ON o.id = oi.outbound_id
-        WHERE oi.product_id = %s
-          AND o.status = 'CONFIRMED'
-        GROUP BY o.outbound_date
-        ORDER BY o.outbound_date
-    """
-    conn = _get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(query, (product_id,))
-            rows = cur.fetchall()
-    except psycopg2.Error as exc:
-        raise RuntimeError(f"Database query failed: {exc}") from exc
-    finally:
-        _release_db_connection(conn)
+    # The psycopg2 instrumentation emits its own DB-query span, which nests under
+    # this span automatically (this runs inside the active context, propagated
+    # across asyncio.to_thread which copies contextvars).
+    with tracer.start_as_current_span("ai.fetch_outbound_history") as span:
+        span.set_attribute("product.id", product_id)
+        query = """
+            SELECT o.outbound_date AS ds, SUM(oi.quantity) AS y
+            FROM outbounds o
+            JOIN outbound_items oi ON o.id = oi.outbound_id
+            WHERE oi.product_id = %s
+              AND o.status = 'CONFIRMED'
+            GROUP BY o.outbound_date
+            ORDER BY o.outbound_date
+        """
+        conn = _get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query, (product_id,))
+                rows = cur.fetchall()
+        except psycopg2.Error as exc:
+            raise RuntimeError(f"Database query failed: {exc}") from exc
+        finally:
+            _release_db_connection(conn)
 
-    if not rows:
-        return pd.DataFrame(columns=["ds", "y"])
+        span.set_attribute("history.rows", len(rows))
+        if not rows:
+            return pd.DataFrame(columns=["ds", "y"])
 
-    df = pd.DataFrame(rows)
-    df["ds"] = pd.to_datetime(df["ds"])
-    df["y"] = df["y"].astype(float)
-    return df
+        df = pd.DataFrame(rows)
+        df["ds"] = pd.to_datetime(df["ds"])
+        df["y"] = df["y"].astype(float)
+        return df
 
 
 def _fill_missing_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -122,23 +141,32 @@ async def train_or_load_model_async(product_id: int) -> Any:
     Runs the blocking Prophet fit() in a thread executor so the FastAPI event loop
     is not blocked during model training.
     """
-    cached = _model_cache.get(product_id)
-    if cached is not None:
-        return cached
+    with tracer.start_as_current_span("ai.train_or_load_model") as span:
+        span.set_attribute("product.id", product_id)
 
-    df = await asyncio.to_thread(fetch_outbound_history, product_id)
-    df = _fill_missing_dates(df)
+        cached = _model_cache.get(product_id)
+        if cached is not None:
+            span.set_attribute("model.cache_hit", True)
+            MODEL_CACHE_EVENTS.labels(result="hit").inc()
+            return cached
+        span.set_attribute("model.cache_hit", False)
+        MODEL_CACHE_EVENTS.labels(result="miss").inc()
 
-    if len(df) < MIN_HISTORY_DAYS:
-        raise ValueError(
-            f"Insufficient historical data for product {product_id}. "
-            f"Found {len(df)} days, minimum required is {MIN_HISTORY_DAYS}."
-        )
+        df = await asyncio.to_thread(fetch_outbound_history, product_id)
+        df = _fill_missing_dates(df)
+        span.set_attribute("history.days", len(df))
 
-    model = create_prophet_model(yearly_seasonality=True)
-    model = await asyncio.to_thread(fit_prophet, model, df)
-    _model_cache.set(product_id, model)
-    return model
+        if len(df) < MIN_HISTORY_DAYS:
+            raise ValueError(
+                f"Insufficient historical data for product {product_id}. "
+                f"Found {len(df)} days, minimum required is {MIN_HISTORY_DAYS}."
+            )
+
+        model = create_prophet_model(yearly_seasonality=True)
+        with tracer.start_as_current_span("ai.fit_prophet"), MODEL_TRAIN_DURATION.time():
+            model = await asyncio.to_thread(fit_prophet, model, df)
+        _model_cache.set(product_id, model)
+        return model
 
 
 def train_or_load_model(product_id: int) -> Any:
@@ -167,24 +195,34 @@ async def forecast_async(product_id: int, days: int) -> dict[str, Any]:
     if days <= 0:
         raise ValueError("days must be a positive integer")
 
-    model = await train_or_load_model_async(product_id)
-    forecast_df = await asyncio.to_thread(predict_future, model, days)
+    with tracer.start_as_current_span("ai.forecast") as span, FORECAST_DURATION.time():
+        span.set_attribute("product.id", product_id)
+        span.set_attribute("forecast.days", days)
+        try:
+            model = await train_or_load_model_async(product_id)
+            with tracer.start_as_current_span("ai.predict_future"):
+                forecast_df = await asyncio.to_thread(predict_future, model, days)
 
-    future_df = forecast_df.tail(days)
-    records = []
-    for _, row in future_df.iterrows():
-        records.append({
-            "ds": row["ds"].strftime("%Y-%m-%d"),
-            "yhat": round(float(row["yhat"]), 2),
-            "yhat_lower": round(float(row["yhat_lower"]), 2),
-            "yhat_upper": round(float(row["yhat_upper"]), 2),
-        })
+            future_df = forecast_df.tail(days)
+            records = []
+            for _, row in future_df.iterrows():
+                records.append({
+                    "ds": row["ds"].strftime("%Y-%m-%d"),
+                    "yhat": round(float(row["yhat"]), 2),
+                    "yhat_lower": round(float(row["yhat_lower"]), 2),
+                    "yhat_upper": round(float(row["yhat_upper"]), 2),
+                })
+        except Exception:
+            FORECAST_REQUESTS.labels(outcome="error").inc()
+            raise
 
-    return {
-        "product_id": product_id,
-        "days": days,
-        "forecast": records,
-    }
+        FORECAST_REQUESTS.labels(outcome="success").inc()
+        span.set_attribute("forecast.points", len(records))
+        return {
+            "product_id": product_id,
+            "days": days,
+            "forecast": records,
+        }
 
 
 def forecast(product_id: int, days: int) -> dict[str, Any]:
@@ -252,49 +290,59 @@ def fetch_evaluation_history(product_id: int, limit: int = 20) -> list[dict[str,
 
 async def evaluate_async(product_id: int, model_version: str = "prophet") -> dict[str, Any]:
     """Async variant of evaluate() that does not block the event loop."""
-    df = await asyncio.to_thread(fetch_outbound_history, product_id)
-    df = _fill_missing_dates(df)
+    with tracer.start_as_current_span("ai.evaluate") as span:
+        span.set_attribute("product.id", product_id)
+        span.set_attribute("model.version", model_version)
 
-    if len(df) < MIN_HISTORY_DAYS * 2:
-        raise ValueError(
-            f"Insufficient data for evaluation for product {product_id}. "
-            f"Found {len(df)} days, minimum required is {MIN_HISTORY_DAYS * 2}."
-        )
+        df = await asyncio.to_thread(fetch_outbound_history, product_id)
+        df = _fill_missing_dates(df)
 
-    split_idx = int(len(df) * EVALUATION_TRAIN_RATIO)
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
+        if len(df) < MIN_HISTORY_DAYS * 2:
+            raise ValueError(
+                f"Insufficient data for evaluation for product {product_id}. "
+                f"Found {len(df)} days, minimum required is {MIN_HISTORY_DAYS * 2}."
+            )
 
-    model = create_prophet_model(yearly_seasonality=True)
-    await asyncio.to_thread(model.fit, train_df)
+        split_idx = int(len(df) * EVALUATION_TRAIN_RATIO)
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
 
-    future = model.make_future_dataframe(periods=len(test_df))
-    forecast_df = model.predict(future)
-    pred_df = forecast_df.tail(len(test_df)).reset_index(drop=True)
-    actuals = test_df["y"].values
-    predictions = pred_df["yhat"].values
+        model = create_prophet_model(yearly_seasonality=True)
+        with tracer.start_as_current_span("ai.fit_prophet"), MODEL_TRAIN_DURATION.time():
+            await asyncio.to_thread(model.fit, train_df)
 
-    mae = float(np.mean(np.abs(actuals - predictions)))
-    rmse = float(np.sqrt(np.mean((actuals - predictions) ** 2)))
-    mape = float(np.mean(np.abs((actuals - predictions) / np.where(actuals == 0, 1, actuals))) * 100)
+        with tracer.start_as_current_span("ai.predict"):
+            future = model.make_future_dataframe(periods=len(test_df))
+            forecast_df = model.predict(future)
+        pred_df = forecast_df.tail(len(test_df)).reset_index(drop=True)
+        actuals = test_df["y"].values
+        predictions = pred_df["yhat"].values
 
-    result = {
-        "product_id": product_id,
-        "mae": round(mae, 4),
-        "rmse": round(rmse, 4),
-        "mape": round(mape, 4),
-        "model_version": model_version,
-    }
+        mae = float(np.mean(np.abs(actuals - predictions)))
+        rmse = float(np.sqrt(np.mean((actuals - predictions) ** 2)))
+        mape = float(np.mean(np.abs((actuals - predictions) / np.where(actuals == 0, 1, actuals))) * 100)
 
-    _store_evaluation(product_id, result["mae"], result["rmse"], result["mape"], model_version)
+        EVALUATION_MAPE.observe(mape)
+        span.set_attribute("evaluation.mape", round(mape, 4))
 
-    if mape > MAPE_ALERT_THRESHOLD:
-        logger.warning(
-            "AI model evaluation alert: product_id=%s MAPE=%.2f%% exceeds %.1f%% threshold (model=%s)",
-            product_id, mape, MAPE_ALERT_THRESHOLD, model_version,
-        )
+        result = {
+            "product_id": product_id,
+            "mae": round(mae, 4),
+            "rmse": round(rmse, 4),
+            "mape": round(mape, 4),
+            "model_version": model_version,
+        }
 
-    return result
+        _store_evaluation(product_id, result["mae"], result["rmse"], result["mape"], model_version)
+
+        if mape > MAPE_ALERT_THRESHOLD:
+            span.set_attribute("evaluation.alert", True)
+            logger.warning(
+                "AI model evaluation alert: product_id=%s MAPE=%.2f%% exceeds %.1f%% threshold (model=%s)",
+                product_id, mape, MAPE_ALERT_THRESHOLD, model_version,
+            )
+
+        return result
 
 
 def evaluate(product_id: int, model_version: str = "prophet") -> dict[str, Any]:

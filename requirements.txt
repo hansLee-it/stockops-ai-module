@@ -17,3 +17,9 @@ opentelemetry-sdk>=1.27.0,<2.0.0
 opentelemetry-exporter-otlp-proto-http>=1.27.0,<2.0.0
 opentelemetry-instrumentation-fastapi>=0.48b0,<1.0.0
 opentelemetry-instrumentation-psycopg2>=0.48b0,<1.0.0
+
+# Prometheus metrics (pull model via /metrics) — the metrics half of the
+# observability split (traces go through OpenTelemetry/OTLP above). Mirrors the
+# api-server's micrometer-registry-prometheus actuator endpoint.
+prometheus-client>=0.20.0,<1.0.0
+prometheus-fastapi-instrumentator>=7.0.0,<8.0.0
